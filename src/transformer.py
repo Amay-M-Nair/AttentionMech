@@ -11,8 +11,6 @@ The full encoder-decoder transformer.
       LayerNorm  ----- memory ----->          LayerNorm
                                                  |
                                             Linear -> vocab logits
-
-See docs/architecture.md#the-full-model.
 """
 
 import math
@@ -103,7 +101,7 @@ class Transformer(nn.Module):
     Encoder-decoder transformer with a single shared vocabulary.
 
     Source embedding, target embedding and output projection are all the same
-    matrix - see docs/architecture.md#weight-tying.
+    matrix.
     """
 
     def __init__(self, config: TransformerConfig):

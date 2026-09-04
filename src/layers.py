@@ -2,7 +2,7 @@
 Encoder and decoder blocks.
 
 Pre-norm throughout: x = x + sublayer(norm(x)), rather than the paper's
-post-norm. See docs/architecture.md#layers.
+post-norm.
 """
 
 import torch.nn as nn

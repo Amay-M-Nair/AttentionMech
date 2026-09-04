@@ -1,13 +1,21 @@
-"""Model hyperparameters. See docs/architecture.md#config."""
+"""Model hyperparameters."""
 
 from dataclasses import dataclass
 
 import torch
 
+# Reserved vocabulary slots. Real tokens start at NUM_SPECIAL.
+PAD_IDX = 0
+SOS_IDX = 1
+EOS_IDX = 2
+UNK_IDX = 3
+NUM_SPECIAL = 4
+SPECIALS = ("<pad>", "<sos>", "<eos>", "<unk>")
+
 
 @dataclass
 class TransformerConfig:
-    """Defaults are smaller than the paper's 512/8/6 - see docs."""
+    """Defaults are smaller than the paper's 512/8/6 - the target dataset is small."""
 
     vocab_size: int = 10000
     d_model: int = 256

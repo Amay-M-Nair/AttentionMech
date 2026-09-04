@@ -9,6 +9,4 @@ Read the modules in this order - each depends only on the ones above it:
     attention.py   multi-head attention
     layers.py      encoder / decoder blocks
     transformer.py the full model
-
-How and why any of it works: docs/architecture.md
 """

@@ -1,4 +1,4 @@
-"""Sinusoidal positional encoding. See docs/architecture.md#positional-encoding."""
+"""Sinusoidal positional encoding."""
 
 import math
 

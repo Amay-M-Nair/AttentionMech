@@ -3,7 +3,7 @@ Multi-head attention.
 
 One class covers all three uses - encoder self-attention, decoder causal
 self-attention, and cross-attention - since they differ only in what is passed
-as query/key/value and which mask. See docs/architecture.md#attention.
+as query/key/value and which mask.
 """
 
 import torch
