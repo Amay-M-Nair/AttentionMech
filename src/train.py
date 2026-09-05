@@ -1,11 +1,16 @@
 """
-Training loop.
+Training.
 
-Teacher forcing: the decoder is fed the correct previous tokens rather than its
-own predictions, so every position trains in parallel. The (tgt_in, tgt_out)
-offset is built into the batch, so nothing is sliced here.
+    fit()       epoch-based, for the parallel corpus
+    pretrain()  step-based, mixed precision, resumable - for the large corpus
+
+Teacher forcing throughout: the (tgt_in, tgt_out) offset is built into the
+batch, so nothing is sliced here.
 """
 
+import math
+import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -18,13 +23,7 @@ from .inference import translate_corpus
 
 
 def make_criterion(pad_idx: int, label_smoothing: float = 0.1):
-    """
-    Padding is excluded from the loss entirely.
-
-    The model emits logits and CrossEntropyLoss log-softmaxes internally. Label
-    smoothing spreads a little probability mass off the correct token, which
-    stops the model driving logits to extremes and generalising worse.
-    """
+    """Padding excluded from the loss. Smoothing keeps logits off extremes."""
     return nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=label_smoothing)
 
 
@@ -36,11 +35,9 @@ def make_optimizer(model, lr: float = 1e-3, weight_decay: float = 0.01):
 
 def make_scheduler(optimizer, warmup: int = 400):
     """
-    Linear warmup, then inverse-square-root decay, as a multiplier on the base
-    learning rate. Peaks at 1.0 exactly when warmup ends.
+    Linear warmup then inverse-sqrt decay, peaking at 1.0 when warmup ends.
 
-    Warmup matters because Adam's second-moment estimate is unreliable in the
-    first few steps; a full-size update then can wreck the initialisation.
+    Warmup matters because Adam's variance estimate is unreliable early.
     """
     def lr_lambda(step):
         step = max(step, 1)
@@ -118,12 +115,10 @@ def train(
 def overfit_batch(model, batch, steps: int = 300, lr: float = 1e-3,
                   log_every: int = 50, verbose: bool = True):
     """
-    Train on ONE batch repeatedly. Loss must collapse towards zero.
+    Train on ONE batch repeatedly; loss must collapse to ~0.
 
-    The cheapest possible check that the plumbing is right: if a model cannot
-    memorise a single batch, the problem is a bug - a mask, a shift, a detached
-    branch - not the data or the hyperparameters. No label smoothing here,
-    since it puts a floor under the loss and hides exactly what we want to see.
+    If a model cannot memorise one batch the problem is a bug, not the data.
+    Smoothing off - it would put a floor under the loss.
     """
     return train(
         model,
@@ -202,17 +197,14 @@ def fit(
     baseline: float = None,
 ):
     """
-    Train for up to `epochs`, keeping the checkpoint with the best validation
-    BLEU.
+    Train up to `epochs`, keeping the best-validation-BLEU checkpoint.
 
-    Selection is on BLEU, not validation loss. The two diverge - loss keeps
-    improving on token-level confidence after BLEU has peaked - and BLEU is
-    what the task is actually judged on.
+    Selection is on BLEU, not loss - they diverge, and BLEU is what the task
+    is judged on.
 
     Args:
-        valid_source/valid_target: raw strings, for scoring real translations
-        baseline: copy-baseline BLEU, printed alongside so the score is never
-                  read in isolation
+        valid_source/valid_target: raw strings, for scoring translations
+        baseline: copy-baseline BLEU, printed alongside
     """
     criterion = make_criterion(model.pad_idx, label_smoothing)
     optimizer = make_optimizer(model, lr)
@@ -264,3 +256,197 @@ def fit(
 
     print(f"\nbest BLEU {best_bleu:.2f} at epoch {best_epoch}  ->  {checkpoint_path}")
     return history
+
+
+# ---------------------------------------------------------------------------
+# Pretraining: step-based, mixed precision, resumable
+#
+# fit() above is epoch-based, which is right for 18k sentence pairs and wrong
+# for 200M words - an "epoch" there is hours long and tells you nothing. These
+# functions train for a fixed number of STEPS and survive a cloud session dying
+# partway through.
+# ---------------------------------------------------------------------------
+
+def save_training_state(path, model, config, step, optimizer=None, scheduler=None,
+                        scaler=None, metrics=None):
+    """
+    Full state, not just weights.
+
+    Resuming from weights alone resets Adam's momentum and restarts the LR
+    schedule at warmup - training then takes badly scaled steps into trained
+    weights. Nothing crashes; it just gets worse.
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "model": model.state_dict(),
+        "config": asdict(config),
+        "step": step,
+        "metrics": metrics or {},
+    }
+    if optimizer is not None:
+        state["optimizer"] = optimizer.state_dict()
+    if scheduler is not None:
+        state["scheduler"] = scheduler.state_dict()
+    if scaler is not None:
+        state["scaler"] = scaler.state_dict()
+
+    # atomic write: a session dying mid-save cannot corrupt the checkpoint
+    tmp = str(path) + ".tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def load_training_state(path, model=None, optimizer=None, scheduler=None,
+                        scaler=None, device=None):
+    """Restore everything saved by save_training_state. Returns (model, state)."""
+    state = torch.load(path, map_location=device or "cpu", weights_only=False)
+
+    if model is None:
+        from .transformer import build_model
+        model = build_model(TransformerConfig(**state["config"]))
+    model.load_state_dict(state["model"])
+    if device is not None:
+        model = model.to(device)
+
+    if optimizer is not None and "optimizer" in state:
+        optimizer.load_state_dict(state["optimizer"])
+    if scheduler is not None and "scheduler" in state:
+        scheduler.load_state_dict(state["scheduler"])
+    if scaler is not None and "scaler" in state:
+        scaler.load_state_dict(state["scaler"])
+
+    return model, state
+
+
+def load_pretrained(model, path, device=None):
+    """Weights only - the pretraining optimizer state is not wanted here."""
+    state = torch.load(path, map_location=device or "cpu", weights_only=False)
+    model.load_state_dict(state["model"])
+    return model.to(device) if device is not None else model
+
+
+def pretrain(
+    model,
+    config,
+    loader,
+    device,
+    steps: int = 100_000,
+    lr: float = 3e-4,
+    warmup: int = 4000,
+    label_smoothing: float = 0.0,
+    clip: float = 1.0,
+    accumulate: int = 1,
+    amp: bool = True,
+    log_every: int = 100,
+    checkpoint_path: str = "checkpoints/pretrain.pt",
+    checkpoint_every: int = 2000,
+    resume: bool = True,
+):
+    """
+    Train for `steps` optimiser updates over an endlessly cycled loader.
+
+    Args:
+        accumulate: micro-batches per update; effective batch = loader batch x this
+        amp: mixed precision, ~2x faster on a T4
+        resume: pick up from checkpoint_path if it exists
+
+    Returns:
+        history dict; tokens_per_sec counts SOURCE tokens, not target
+    """
+    criterion = make_criterion(model.pad_idx, label_smoothing)
+    optimizer = make_optimizer(model, lr)
+    scheduler = make_scheduler(optimizer, warmup)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp and device.type == "cuda")
+
+    start_step = 0
+    if resume and Path(checkpoint_path).exists():
+        _, state = load_training_state(checkpoint_path, model, optimizer,
+                                       scheduler, scaler, device)
+        start_step = state["step"]
+        print(f"resumed from {checkpoint_path} at step {start_step:,}")
+
+    history = {"step": [], "loss": [], "perplexity": [], "lr": [], "tokens_per_sec": []}
+    model.train()
+
+    def batches():
+        while True:
+            for batch in loader:
+                yield batch
+
+    stream = batches()
+    running_loss = running_tokens = 0
+    window_start = time.time()
+
+    for step in range(start_step + 1, steps + 1):
+        optimizer.zero_grad(set_to_none=True)
+
+        for _ in range(accumulate):
+            src, tgt_in, tgt_out = (t.to(device, non_blocking=True) for t in next(stream))
+
+            with torch.amp.autocast("cuda", enabled=scaler.is_enabled()):
+                logits = model(src, tgt_in)
+                loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+                loss = loss / accumulate
+
+            scaler.scale(loss).backward()
+
+            running_loss += loss.item() * accumulate
+            # source tokens = corpus consumed; targets are only ~15% of that
+            running_tokens += int((src != model.pad_idx).sum())
+
+        # unscale before clipping, or the threshold applies to scaled gradients
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+
+        if step % log_every == 0:
+            elapsed = time.time() - window_start
+            mean_loss = running_loss / (log_every * accumulate)
+            tokens_per_sec = running_tokens / max(elapsed, 1e-9)
+            ppl = math.exp(min(mean_loss, 20))
+
+            history["step"].append(step)
+            history["loss"].append(mean_loss)
+            history["perplexity"].append(ppl)
+            history["lr"].append(optimizer.param_groups[0]["lr"])
+            history["tokens_per_sec"].append(tokens_per_sec)
+
+            eta = (steps - step) / log_every * elapsed
+            print(f"step {step:>7,}/{steps:,}  loss {mean_loss:6.3f}  ppl {ppl:8.1f}  "
+                  f"{tokens_per_sec/1000:5.1f}k corpus tok/s  eta {eta/3600:4.1f}h")
+
+            running_loss = running_tokens = 0
+            window_start = time.time()
+
+        if checkpoint_every and step % checkpoint_every == 0:
+            save_training_state(
+                checkpoint_path, model, config, step, optimizer, scheduler, scaler,
+                metrics={"loss": history["loss"][-1] if history["loss"] else None},
+            )
+
+    save_training_state(checkpoint_path, model, config, steps, optimizer, scheduler, scaler)
+    print(f"\ndone -> {checkpoint_path}")
+    return history
+
+
+@torch.no_grad()
+def perplexity(model, loader, device, max_batches: int = 50) -> float:
+    """Validation perplexity, weighted by real tokens."""
+    criterion = make_criterion(model.pad_idx, label_smoothing=0.0)
+    model.eval()
+
+    total_loss = total_tokens = 0
+    for i, (src, tgt_in, tgt_out) in enumerate(loader):
+        if i >= max_batches:
+            break
+        src, tgt_in, tgt_out = src.to(device), tgt_in.to(device), tgt_out.to(device)
+        logits = model(src, tgt_in)
+        n = int((tgt_out != model.pad_idx).sum())
+        total_loss += criterion(logits.reshape(-1, logits.size(-1)),
+                                tgt_out.reshape(-1)).item() * n
+        total_tokens += n
+
+    model.train()
+    return math.exp(min(total_loss / max(total_tokens, 1), 20))

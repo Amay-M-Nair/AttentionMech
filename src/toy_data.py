@@ -1,18 +1,10 @@
 """
-Toy sequence tasks: copy and reverse.
+Toy copy / reverse tasks - random integer sequences, used to prove the model
+learns before any real corpus exists.
 
-Random integer sequences, so the model can be checked for the ability to learn
-before any tokeniser or real corpus exists. Lengths vary within a batch, which
-is deliberate - it exercises padding, and padding is where mask bugs hide.
-
-Each batch is a (src, tgt_in, tgt_out) triple:
-
-    src      content + EOS            what the encoder reads
-    tgt_in   SOS + target             what the decoder is fed (teacher forcing)
-    tgt_out  target + EOS             what the decoder is graded against
-
-tgt_in and tgt_out are the same sequence offset by one, so predicting position
-t of tgt_in should produce position t of tgt_out.
+    src      content + EOS
+    tgt_in   SOS + target
+    tgt_out  target + EOS
 """
 
 import torch
@@ -80,12 +72,6 @@ def pad_stack(rows, pad_idx: int = PAD_IDX) -> torch.Tensor:
     for i, row in enumerate(rows):
         out[i, : len(row)] = row
     return out
-
-
-def batch_stream(steps: int, **kwargs):
-    """Yield `steps` fresh batches. Every step sees unseen data."""
-    for _ in range(steps):
-        yield make_batch(**kwargs)
 
 
 def describe(src, tgt_in, tgt_out, index: int = 0) -> str:

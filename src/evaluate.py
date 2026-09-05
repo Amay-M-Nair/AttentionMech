@@ -1,18 +1,8 @@
 """
-Evaluation metrics.
+BLEU, always reported against the copy baseline.
 
-## Why tokenize="none"
-
-sacreBLEU normally applies its own tokenizer so that scores are comparable
-across projects. Our corpus is ALREADY tokenised (the .nltktok files), and
-running a second tokeniser over it would split things twice and quietly shift
-the score.
-
-So every BLEU call here passes tokenize="none", which means plain whitespace
-splitting. The important part is not which setting is used but that the SAME
-setting is used everywhere - the copy baseline, validation during training, and
-the final test number. Mixing them produces numbers that cannot be compared,
-which is one of the easiest ways to fool yourself about progress.
+tokenize="none" everywhere: the corpus is already tokenised, and the setting
+must match across the baseline, validation and the final test number.
 """
 
 import sacrebleu
@@ -45,12 +35,3 @@ def copy_baseline(source, target) -> float:
     has learned almost nothing.
     """
     return bleu(source, target)
-
-
-def summarise(hypotheses, references, source=None) -> dict:
-    """BLEU alongside the baseline, so the score is never read in isolation."""
-    result = {"bleu": bleu(hypotheses, references)}
-    if source is not None:
-        result["copy_baseline"] = copy_baseline(source, references)
-        result["gain"] = result["bleu"] - result["copy_baseline"]
-    return result

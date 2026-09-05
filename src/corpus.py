@@ -1,24 +1,8 @@
 """
-Pretraining corpus: Project Gutenberg literature.
+Gutenberg pretraining corpus, streamed from `sedthh/gutenberg_english`.
 
-Phase 4 failed because 474k words cannot teach a model English. This module
-supplies ~200M words of it.
-
-Source is `sedthh/gutenberg_english` on HuggingFace - the English Gutenberg
-corpus as parquet shards. We STREAM a subset rather than downloading the whole
-thing: `streaming=True` pulls shards lazily, so a 200M-word subset costs a few
-hundred MB of traffic and no disk.
-
-(The better-known PG-19 release is unusable here - it ships as a loading script,
-which `datasets` 5.x dropped support for.)
-
-Why literature rather than Wikipedia: every token is stylistically relevant -
-prose, dialogue, narrative voice - and the collection already contains
-Shakespeare, the King James Bible, Marlowe and Milton, so Early Modern English
-arrives without a separate domain-adaptation stage.
-
-The trade is noise. Gutenberg text carries OCR artefacts, transcriber notes and
-licence boilerplate, so `clean_text` earns its place.
+Tokenise once into a flat uint16 file and memory-map it: later epochs cost
+nothing and the dataloader never touches the network.
 """
 
 import re
@@ -40,7 +24,7 @@ _BLANKLINES = re.compile(r"\n{3,}")
 
 
 def clean_text(text: str) -> str:
-    """Strip Gutenberg furniture and normalise whitespace."""
+    """Strip Gutenberg boilerplate and normalise whitespace."""
     text = _BOILERPLATE.sub(" ", text)
     text = _UNDERSCORES.sub(r"\1", text)
     text = text.replace("\r", "")
@@ -51,17 +35,7 @@ def clean_text(text: str) -> str:
 def stream_gutenberg(max_words: int = 200_000_000, split: str = "train",
                      min_chars: int = 2000, progress_every: int = 200,
                      dataset: str = GUTENBERG, text_column: str = TEXT_COLUMN):
-    """
-    Yield cleaned book texts until `max_words` have been produced.
-
-    Args:
-        max_words: stop once this many whitespace words have been yielded
-        min_chars: skip anything shorter than this after cleaning
-        progress_every: print a progress line every N books, 0 to silence
-
-    Yields:
-        str - one cleaned book at a time
-    """
+    """Yield cleaned book texts until `max_words` have been produced."""
     from datasets import load_dataset
 
     stream = load_dataset(dataset, split=split, streaming=True)
@@ -84,48 +58,6 @@ def stream_gutenberg(max_words: int = 200_000_000, split: str = "train",
     print(f"  done: {books} books, {words / 1e6:.1f}M words")
 
 
-def to_chunks(texts, tokenizer, seq_len: int = 256, drop_last: bool = True):
-    """
-    Turn a stream of documents into fixed-length token sequences.
-
-    Documents are concatenated and sliced at `seq_len`, rather than padding each
-    one - padding a 200M-word corpus would waste an enormous amount of compute.
-    Chunks therefore cross sentence and document boundaries, which is standard
-    for pretraining and harmless: the model is learning language, not documents.
-
-    Yields:
-        list[int] - token ids of length seq_len
-    """
-    buffer = []
-    for text in texts:
-        buffer.extend(tokenizer.encode(text))
-        while len(buffer) >= seq_len:
-            yield buffer[:seq_len]
-            buffer = buffer[seq_len:]
-
-    if buffer and not drop_last:
-        yield buffer
-
-
-def write_lines(texts, path, max_words: int = None):
-    """
-    Dump a corpus stream to a plain text file, one paragraph per line.
-
-    Used to build the SentencePiece training input, which wants a file rather
-    than a generator.
-    """
-    written = 0
-    with open(path, "w", encoding="utf-8") as f:
-        for text in texts:
-            for paragraph in text.split("\n\n"):
-                paragraph = paragraph.strip()
-                if not paragraph:
-                    continue
-                f.write(paragraph + "\n")
-                written += paragraph.count(" ") + 1
-            if max_words and written >= max_words:
-                break
-    return written
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +118,7 @@ class TokenFileDataset:
     """
     Fixed-length windows over a memory-mapped token file.
 
-    Chunks cross sentence and document boundaries. That is standard for
-    pretraining and harmless - the model is learning language, not documents.
+    Windows cross document boundaries - standard for pretraining.
     """
 
     def __init__(self, path, seq_len: int = 256):

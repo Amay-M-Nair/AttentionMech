@@ -1,9 +1,5 @@
-"""
-Attention masks. True = may attend, False = blocked.
-
-Shapes are broadcast-friendly against scores of (batch, heads, q_len, k_len),
-so one masked_fill covers every attention type.
-"""
+"""Attention masks. True = may attend. Shapes broadcast against
+(batch, heads, q_len, k_len) scores."""
 
 import torch
 

@@ -1,14 +1,7 @@
 """
-Word-level vocabulary, shared between source and target.
+Word-level vocabulary shared by source and target (Phases 3-4).
 
-One vocabulary for both sides, not two. Shakespeare and modern English are the
-same language - 91% of source tokens also appear on the target side - so a word
-should carry the same index wherever it shows up. That is also what makes the
-tied embeddings in transformer.py pay off: copying a word through the model
-becomes nearly free.
-
-The corpus is already tokenised (NLTK, in the .nltktok files), so splitting on
-whitespace is all that is needed here.
+Superseded by spm_tokenizer.py; kept because notebooks 02 and 03 use it.
 """
 
 import json

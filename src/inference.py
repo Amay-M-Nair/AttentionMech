@@ -1,11 +1,7 @@
 """
-Greedy decoding.
+Decoding: greedy and beam search.
 
-Training runs the whole target through at once. Generation cannot - the input
-at step t is the model's own output from step t-1. So the encoder runs once and
-the decoder runs once per token.
-
-Beam search comes later; greedy is enough to see whether the model learned.
+The encoder runs once, the decoder once per token.
 """
 
 import torch
@@ -16,12 +12,7 @@ from .masking import make_pad_mask
 
 
 def step_logprobs(model, tokens, memory, src_mask):
-    """
-    Log-probabilities for the NEXT token only.
-
-    Shared by greedy and beam search so both decode from exactly the same
-    distribution.
-    """
+    """Log-probabilities for the next token. Shared by greedy and beam."""
     output, _, _ = model.decode(tokens, memory, src_mask=src_mask)
     return F.log_softmax(model.generator(output[:, -1]), dim=-1)
 
@@ -113,17 +104,9 @@ def translate_corpus(model, lines, vocab, device=None, batch_size: int = 128,
                      max_len: int = None, beam_size: int = 1,
                      length_penalty: float = 0.6) -> list:
     """
-    Translate many sentences at once.
+    Translate many sentences at once, sorted by length to limit padding.
 
-    Sentences are sorted by length so each batch pads to a similar width, then
-    restored to the original order. Same trick as the training sampler, and the
-    basis for the book pipeline later.
-
-    Args:
-        lines: list of whitespace-tokenised source strings
-
-    Returns:
-        list of translated strings, aligned with `lines`
+    Returns translations aligned with `lines`.
     """
     model.eval()
     if device is None:
@@ -162,23 +145,15 @@ def beam_search_decode(model, src, beam_size: int = 5, max_len: int = None,
     """
     Beam search over a batch of sentences.
 
-    Greedy decoding commits to the highest-probability token at every step and
-    cannot take it back - which is how the model ends up in "then then" loops.
-    Beam search keeps `beam_size` partial hypotheses alive and picks the best
-    complete one at the end.
-
-    Length penalty (GNMT form):  score / ((5 + L) / 6) ** alpha
-
-    Raw log-probabilities are sums over tokens, so they always favour SHORT
-    output. Dividing by a length term removes that bias; alpha ~0.6 is the
-    usual setting.
+    Length penalty (GNMT): score / ((5 + L) / 6) ** alpha. Log-probs are sums
+    over tokens, so they favour short output; the penalty removes that bias.
+    Measured best here is alpha ~1.5, not the usual 0.6.
 
     Args:
         src: (batch, src_len)
 
     Returns:
-        (batch, generated_len) - the best beam per sentence, start token
-        stripped, padded after EOS.
+        (batch, generated_len) - best beam per sentence, padded after EOS.
     """
     model.eval()
     device = src.device

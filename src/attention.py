@@ -1,10 +1,6 @@
-"""
-Multi-head attention.
-
-One class covers all three uses - encoder self-attention, decoder causal
-self-attention, and cross-attention - since they differ only in what is passed
-as query/key/value and which mask.
-"""
+"""Multi-head attention. One class serves encoder self-attention, decoder
+causal self-attention and cross-attention - they differ only in the Q/K/V
+passed and the mask."""
 
 import torch
 import torch.nn as nn
@@ -63,11 +59,10 @@ class MultiHeadAttention(nn.Module):
         K = self._split_heads(self.W_k(key))
         V = self._split_heads(self.W_v(value))
 
-        # scaled by head_dim, not d_model - after the split that is the d_k
+        # head_dim, not d_model: after the split that is the d_k
         scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)
 
-        # mask before softmax. finfo.min rather than -inf so a fully masked
-        # row yields zeros instead of NaN
+        # finfo.min not -inf: a fully masked row would otherwise give NaN
         if mask is not None:
             scores = scores.masked_fill(mask == 0, torch.finfo(scores.dtype).min)
 

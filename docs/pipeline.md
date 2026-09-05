@@ -1,165 +1,188 @@
 # Pipeline
 
-Shakespeare → modern English translation, built on the architecture from *Attention Is All You Need*.
+Shakespeare → modern English translation, built on the architecture from *Attention Is All You Need*, then pretrained so it has enough language to work with.
+
+---
+
+## Why there is a pretraining stage
+
+Phase 4 trained the architecture directly on the parallel corpus and **lost to echoing the input**: test BLEU 15.07 against a 19.22 copy baseline. ([full analysis](phase4_findings.md))
+
+Not a bug — a data shortfall, stateable exactly:
+
+| | |
+|---|---|
+| Parallel corpus | **474,478 words** |
+| Model | 8,111,872 params |
+| Words per parameter | **0.06** |
+| Rule of thumb (Chinchilla) | ~20 |
+| **Shortfall** | **~340×** |
+
+The model had to learn what English words mean, how English sentences are built, *and* the Shakespeare→modern mapping — all from 18,395 sentence pairs. Pretraining moves the first two off the parallel corpus, so the 18k pairs only have to teach the third.
 
 ---
 
 ## Overview
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │  STAGE 0  ·  TOKENIZER                  │
-                    │  SentencePiece unigram, 32k joint vocab │
-                    └────────────────────┬────────────────────┘
-                                         │
-      ┌──────────────────────────────────┼──────────────────────────────────┐
-      │                                  │                                  │
-      ▼                                  ▼                                  ▼
-┌───────────┐                    ┌───────────────┐                  ┌──────────────┐
-│ WikiText  │                    │  Gutenberg    │                  │ No Fear      │
-│  ~103M w  │                    │  Early Modern │                  │ Shakespeare  │
-│           │                    │  ~3-5M words  │                  │ 18,395 pairs │
-└─────┬─────┘                    └───────┬───────┘                  └──────┬───────┘
-      │                                  │                                 │
-      ▼                                  ▼                                 ▼
-┌───────────────────┐          ┌───────────────────┐          ┌───────────────────┐
-│ STAGE 1           │          │ STAGE 2           │          │ STAGE 3           │
-│ PRETRAIN          │─weights─▶│ DOMAIN ADAPT      │─weights─▶│ FINE-TUNE         │
-│                   │          │                   │          │                   │
-│ span corruption   │          │ span corruption   │          │ seq2seq,          │
-│ 3 epochs          │          │ archaic English   │          │ teacher forcing   │
-│ ~5-6 h  (T4)      │          │ ~1 h             │          │ ~10 min           │
-│                   │          │                   │          │                   │
-│ learns: words     │          │ learns: thou/     │          │ learns: the       │
-│ + syntax          │          │ dost/-eth/-est    │          │ style mapping     │
-└───────────────────┘          └───────────────────┘          └─────────┬─────────┘
-                                                                        │
-                                                                        ▼
-                                                        ┌───────────────────────────┐
-                                                        │ STAGE 4  ·  DECODE        │
-                                                        │ beam 4-5, length α ≈ 1.5  │
-                                                        └─────────────┬─────────────┘
-                                                                      │
-                                        ┌─────────────────────────────┴──────────────┐
-                                        ▼                                            ▼
-                          ┌───────────────────────────┐              ┌───────────────────────────┐
-                          │ STAGE 5  ·  EVALUATE      │              │ STAGE 6  ·  BOOK PIPELINE │
-                          │ BLEU vs copy baseline     │              │ parse → segment → batch   │
-                          │ by-length · unk · dup     │              │ → decode → reassemble     │
-                          └───────────────────────────┘              └───────────────────────────┘
+   ┌──────────────────────┐              ┌──────────────────────┐
+   │  Gutenberg English   │              │  No Fear Shakespeare │
+   │  ~200M words         │              │  18,395 pairs        │
+   │  (streamed)          │              │  split by play       │
+   └──────────┬───────────┘              └───────────┬──────────┘
+              │                                      │
+              ▼                                      │
+   ┌──────────────────────────────────────┐          │
+   │  PHASE 5 · TOKENIZER          ✅     │          │
+   │  SentencePiece unigram, 32k          │◀─────────┤ trained on both,
+   │  + 100 sentinels, + 2 direction      │          │ so the corpus
+   │  unk 5.69% → 0.00%,  round-trip 0 ✗  │          │ round-trips exactly
+   └──────────┬───────────────────────────┘          │
+              │                                      │
+              ▼                                      │
+   ┌──────────────────────────────────────┐          │
+   │  PHASE 6 · INFRASTRUCTURE            │          │
+   │  span corruption · AMP               │          │
+   │  grad accumulation · resume          │          │
+   └──────────┬───────────────────────────┘          │
+              │                                      │
+              ▼                                      │
+   ┌──────────────────────────────────────┐          │
+   │  PHASE 7 · PRETRAIN        ~3.2 h    │          │
+   │  37M params, seq 256                 │          │
+   │  learns words + syntax               │          │
+   └──────────┬───────────────────────────┘          │
+              │ weights                              │
+              ▼                                      ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │  PHASE 8 · FINE-TUNE + EVALUATE            ~30 min       │
+   │  teacher forcing · beam 4-5, α ≈ 1.5                     │
+   │  TARGET: beat 19.22                                      │
+   └──────────┬───────────────────────────────────────────────┘
+              │
+      ┌───────┴────────┐
+      ▼                ▼
+┌───────────┐   ┌──────────────┐
+│ PHASE 9   │   │  PHASE 10    │
+│ book      │   │  multilingual│
+│ pipeline  │   │  6 languages │
+└───────────┘   └──────────────┘
 ```
 
 ---
 
-## Stages
+## Phases
 
-| # | Stage | Input | Output | Time | Status |
-|---|---|---|---|---|---|
-| 0 | Tokenizer | all corpora | `spm32k.model` | 2 min | config validated |
-| 1 | Pretrain | ~200–300M words | base weights | 5–6 h | to build |
-| 2 | Domain adapt | 3–5M archaic words | adapted weights | ~1 h | optional |
-| 3 | Fine-tune | 18,395 pairs | translator | 10 min | **built** |
-| 4 | Decode | trained model | translations | — | **built** |
-| 5 | Evaluate | translations | BLEU + diagnostics | — | **built** |
-| 6 | Book pipeline | a play | modern play | — | to build |
+| # | Phase | Deliverable | Time | Status |
+|---|---|---|---|---|
+| 1 | Model foundation | architecture, verified | — | ✅ |
+| 2 | Prove it learns | toy copy/reverse, diagonal attention | — | ✅ |
+| 3 | Real data | corpus, vocab, **copy baseline 19.22** | — | ✅ |
+| 4 | Train from scratch | 15.07 — below baseline | — | ✅ negative result |
+| 5 | Tokenizer + corpus | SentencePiece 32k, Gutenberg stream | ~45 min | ✅ |
+| **6** | **Infrastructure** | span corruption, AMP, resume | ~1 h | **next** |
+| 7 | Pretrain | a model that knows English | ~3.2 h | |
+| 8 | Fine-tune + evaluate | **beat 19.22** | ~30 min | |
+| 9 | Book pipeline | translate a whole play | ~2 h | |
+| 10 | Multilingual | de/fr/es/hi/ml/ta | later | |
 
-Times are for a Colab/Kaggle T4 or P100.
-
----
-
-### Stage 0 — Tokenizer
-
-SentencePiece unigram, **32k joint vocab**, trained on all corpora together. Special ids pinned to `pad=0, sos=1, eos=2, unk=3`.
-
-Validated at 8k on the parallel corpus: `<unk>` **5.69% → 0.01%**, 2923/2924 exact round-trip, fertility 1.10–1.18 pieces per word.
-
-```
-thou      → ▁thou
-speak'st  → ▁speak + ' + st
-sweeting  → ▁sweet + ing
-Montague  → ▁Mo + n + t + a + g + u + e     (was <unk>)
-```
-
-### Stage 1 — Pretrain
-
-**Objective:** span corruption — mask contiguous spans in the encoder input, reconstruct them in the decoder. This is what teaches word meanings and syntax; they are not separable stages.
-
-**Model:** d_model 384–512, 6 encoder + 6 decoder layers, 8 heads, d_ff 1536–2048 → **30–60M params**.
-
-**Corpus:** WikiText-103 (~103M words) + a Gutenberg literature subset (~100–200M).
-
-> Chinchilla-optimal for 300M tokens is ~15M params, so 60M is under-trained. Normal at this scale, and still transformative versus training on 18k pairs alone.
-
-### Stage 2 — Domain adaptation *(optional)*
-
-Same objective, archaic text only. Free and pre-1800:
-
-| Source | Words |
-|---|---|
-| Shakespeare, complete works | ~885k |
-| King James Bible | ~790k |
-| Marlowe, Jonson, Spenser, Milton | ~1–2M |
-
-~15× more archaic English than the parallel corpus contains.
-
-### Stage 3 — Fine-tune
-
-Teacher forcing on the 18,395 pairs. Decoder input `[<sos>] + tgt[:-1]`, labels `tgt[1:] + [<eos>]`.
-
-Split is **by play** — 15 train, *Twelfth Night* valid, *Romeo and Juliet* test. Never reshuffle; lines from one play would leak across sides.
-
-### Stage 4 — Decode
-
-Beam 4–5, GNMT length penalty **α ≈ 1.5**.
-
-> α=1.5, not the textbook 0.6 — measured. The model under-generates, so it needs a stronger length correction. At 0.6 beam gave +0.77 BLEU; at 1.5, +1.40.
-
-### Stage 5 — Evaluate
-
-| Metric | Why |
-|---|---|
-| BLEU vs **copy baseline** | echoing the input already scores 19.22; BLEU alone is meaningless here |
-| BLEU by source length | overall BLEU hides collapse on long sentences |
-| `<unk>` rate | each one is a guaranteed miss that breaks surrounding n-grams |
-| Adjacent duplicate rate | catches "then then" decoding loops |
-
-### Stage 6 — Book pipeline
-
-```
-raw play
-  → classify lines (heading / stage direction / SPEAKER: / dialogue)
-  → segment dialogue into sentences
-  → split anything over max_len on ; : ,
-  → sort by length, batch, beam decode
-  → restore order, rejoin, detokenise
-  → reassemble with original structure
-```
+Times assume a Kaggle T4 or P100. **~5 h from here to a real number.**
 
 ---
 
-## Current results
+### Phase 5 — Tokenizer and corpus ✅
 
-| | valid | test |
+`src/spm_tokenizer.py` · `src/corpus.py` · `data/spm32k.model`
+
+SentencePiece unigram, 32k joint vocab, trained on Gutenberg **and** the parallel corpus so the latter round-trips exactly. Special ids pinned to `pad=0, sos=1, eos=2, unk=3`; sentinels at 6–105; direction tokens at 4–5.
+
+Corpus is `sedthh/gutenberg_english` — English Gutenberg as parquet, streamed rather than downloaded. *(PG-19 is unusable: it ships as a loading script, dropped by `datasets` 5.x.)*
+
+**Gate results:**
+
+| | word-level (Phase 3) | subword (Phase 5) |
 |---|---|---|
-| **Copy baseline** | **15.97** | **19.22** |
-| From-scratch, 8.1M params, no pretraining | 14.20 | 15.07 |
-| From-scratch, 4.0M params | 13.67 | 14.77 |
+| Round-trip exact | — | **0 failures / 8,924** |
+| `<unk>` on test source | 5.69% | **0.0000%** |
+| Fertility (pieces/word) | — | **1.07–1.08** |
+| Vocabulary | 10,119 words | 32,000 subwords |
 
-Measured diagnostics on the 8.1M model:
+```
+thou      → ▁thou              hath      → ▁hath
+speak'st  → ▁speak + ' + st    sweeting  → ▁sweet + ing
+Montague  → ▁Montague          wherefore → ▁wherefore
+```
 
-| Source tokens | n | Model | Copy |
-|---|---|---|---|
-| 1–5 | 368 | 25.84 | 28.12 |
-| 6–10 | 550 | 18.87 | 24.33 |
-| 11–15 | 252 | 17.94 | 22.03 |
-| 16–25 | 200 | 10.32 | 15.44 |
-| 26+ | 92 | 6.18 | 10.11 |
+`Montague` was 7 pieces at a 8k trial and is 1 here — Gutenberg contains Shakespeare.
 
-- `<unk>` **3.65%** of output tokens
-- adjacent duplicates **0.85%** vs 0.02% in references
-- copies **61.8%** of tokens from source; references copy 54.3% — it over-copies, and its edits are wrong
+### Phase 6 — Infrastructure
 
-**Why Stage 1 exists:** 474,478 words of parallel data against 8.1M parameters is 0.06 words per parameter. The rule of thumb is ~20. That model needs ~160M words — a **340× shortfall**. No architecture change closes that; only pretraining does.
+`src/denoising.py` · changes to `src/train.py`, `src/config.py`
+
+**Span corruption** (T5's objective): mask 15% of tokens in spans of mean length 3. Encoder sees each span replaced by one sentinel; decoder reconstructs only the missing spans.
+
+```
+original   The cat sat on the mat and purred
+encoder    The <extra_id_0> on the mat <extra_id_1> purred
+decoder    <extra_id_0> cat sat <extra_id_1> and <extra_id_2>
+```
+
+Filling blanks forces word meanings *and* syntax out of raw text, with no labels. They are not separable stages — one objective teaches both.
+
+Four gaps in the current trainer:
+
+| Gap | Why |
+|---|---|
+| Step-based `pretrain()` | `fit()` is epoch-based; epochs are meaningless over 200M words |
+| Mixed precision | **~2× faster** on a T4 |
+| Gradient accumulation | effective batch 128+ without the VRAM |
+| **Resume with optimizer state** | `save_checkpoint` stores only weights; a resumed run would restart the LR schedule |
+
+**Gate:** overfit one batch of corrupted spans to near-zero loss.
+
+### Phase 7 — Pretrain
+
+d_model 384, 6 encoder + 6 decoder layers, 8 heads, d_ff 1536, vocab 32k → **~37M params**, seq len 256. Scaling is a config change; the architecture is untouched.
+
+**Gate:** validation perplexity falling; checkpoint every ~15 min with optimizer state; mask a span in a held-out sentence and confirm the fill is plausible English.
+
+### Phase 8 — Fine-tune and evaluate
+
+Load Phase 7 weights, teacher forcing on the 18k pairs. Split stays **by play** — 15 train, *Twelfth Night* valid, *Romeo and Juliet* test.
+
+Decode with beam 4–5 and length penalty **α ≈ 1.5** — measured, not the textbook 0.6.
+
+**Gate**, against the Phase 4 numbers:
+
+| Metric | Phase 4 | Target |
+|---|---|---|
+| Test BLEU | 15.07 | **> 19.22** |
+| BLEU at 26+ tokens | 6.18 | > 10.11 |
+| `<unk>` in output | 3.65% | ~0% |
+| Adjacent duplicates | 0.85% | ~0.02% |
+
+### Phases 9–10
+
+**9 — Book pipeline.** Classify lines (heading / stage direction / `SPEAKER:` / dialogue), segment, split long lines on `; : ,`, batch-decode, reassemble with the original structure.
+
+**10 — Multilingual.** Joint SentencePiece across en/de/fr/es/hi/ml/ta, `<2xx>` as the first decoder token, temperature-balanced sampling so low-resource pairs are not drowned.
+
+---
+
+## Tokenization vs embeddings
+
+Two different things. SentencePiece does only the first.
+
+```
+"Thy wit is bitter"
+  ├─ 1. TOKENIZE (SentencePiece)   →  [▁thy, ▁wit, ▁is, ▁bitter]
+  ├─ 2. LOOKUP IDS                 →  [412, 891, 25, 3301]
+  ├─ 3. nn.Embedding(32000, 384)   →  4 × 384 vectors    ← STATIC, word2vec-like
+  ├─ 4. + positional encoding
+  └─ 5. 6 encoder layers           →  4 × 384 vectors    ← CONTEXTUAL
+```
+
+**No word2vec or GloVe.** GloVe is word-level and this vocabulary is subword; learned jointly, embeddings live in the space the attention layers expect; and step 5 dominates anyway. Step 3 gives `bitter` one fixed vector forever — after the encoder, `bitter` in "bitter apple" and "bitter enemy" differ, because self-attention mixed in the context. That is what attention buys.
 
 ---
 
@@ -172,22 +195,28 @@ src/
   positional.py     sinusoidal encoding
   attention.py      multi-head attention (all three uses)
   layers.py         encoder / decoder blocks, pre-norm
-  transformer.py    full model, tied embeddings, pointer-generator
-  vocab.py          word-level vocabulary
-  dataset.py        corpus loading, bucketed batching
+  transformer.py    full model, tied embeddings
+
+  spm_tokenizer.py  SentencePiece subwords            ← Phase 5
+  corpus.py         Gutenberg streaming + token file  ← Phase 5
+  vocab.py          word-level vocab (Phases 3-4)
+  dataset.py        parallel corpus, bucketed batching
+  toy_data.py       copy / reverse tasks
+
   train.py          teacher forcing, fit loop, checkpointing
   inference.py      greedy + beam search, corpus translation
-  evaluate.py       BLEU, copy baseline
-  toy_data.py       copy/reverse tasks
+  evaluate.py       BLEU against the copy baseline
 
 notebooks/
   00_transformer_foundation.ipynb   architecture, verified
   01_toy_copy_task.ipynb            proves it learns
-  02_shakespeare_data.ipynb         corpus + baseline
-  03_train_shakespeare.ipynb        training
+  02_shakespeare_data.ipynb         corpus + copy baseline
+  03_train_shakespeare.ipynb        Phase 4 — negative result
 
-data/       corpus + vocab.json
-checkpoints/
+docs/
+  pipeline.md            this file
+  phase4_findings.md     why from-scratch failed
+  notes.md               week 1-2 working notes
 ```
 
 ---

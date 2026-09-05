@@ -1,21 +1,9 @@
 """
-SentencePiece subword tokenizer.
+SentencePiece subword tokenizer. Same encode/decode/__len__ surface as Vocab,
+so the datasets and decoders work against either.
 
-Replaces the word-level vocabulary in vocab.py, which left 3.65% of decoder
-output as <unk> and turned long sentences into unreadable soup. Subwords remove
-<unk> entirely - any word can be spelled from smaller pieces - and let related
-forms share structure, so `thou`, `thee` and `thy` stop being three unrelated
-rows in a lookup table.
-
-TOKENIZATION IS NOT EMBEDDING. This file only splits text into ids. Those ids
-are then looked up in nn.Embedding (a static vector per token, the word2vec-like
-part) and only become CONTEXTUAL after passing through the encoder's attention
-layers. No word2vec or GloVe is involved anywhere: the embedding table is
-learned from scratch during pretraining, which is both simpler and better,
-since GloVe is word-level and this vocabulary is not.
-
-The interface matches Vocab in vocab.py - encode / decode / __len__ - so
-TranslationDataset and translate_corpus work against either one unchanged.
+Tokenisation only - ids become vectors in nn.Embedding, and contextual only
+after the encoder.
 """
 
 from pathlib import Path
@@ -53,19 +41,10 @@ class SPMTokenizer:
               model_type: str = "unigram", character_coverage: float = 0.9999,
               input_sentence_size: int = 5_000_000):
         """
-        Train on one or more plain-text files.
+        Train on one or more plain-text files, one sentence per line.
 
-        Args:
-            input_files: path or list of paths, one sentence/paragraph per line
-            input_sentence_size: sample this many lines rather than reading all
-                of a 200M-word corpus into memory; SentencePiece shuffles first
-
-        Special ids are pinned to the values in config.py. SentencePiece leaves
-        pad disabled by default, which would silently shift every other id and
-        corrupt every checkpoint written before the change.
-
-        Sentinels and direction tokens are registered as user-defined symbols so
-        they survive tokenisation as single units.
+        Special ids are pinned to config.py - SentencePiece disables pad by
+        default, which would shift every other id.
         """
         prefix = Path(model_prefix)
         prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -92,14 +71,6 @@ class SPMTokenizer:
     def __len__(self):
         return self.sp.get_piece_size()
 
-    @property
-    def itos(self):
-        return [self.sp.id_to_piece(i) for i in range(len(self))]
-
-    def token_id(self, token: str) -> int:
-        """Id of a whole token, e.g. a direction token or a sentinel."""
-        return self.sp.piece_to_id(token)
-
     def encode(self, line: str, add_sos: bool = False, add_eos: bool = False) -> list:
         ids = self.sp.encode(line.strip(), out_type=int)
         if add_sos:
@@ -112,11 +83,8 @@ class SPMTokenizer:
         """
         Ids back to text, stopping at <eos>.
 
-        Trained on the already-tokenised parallel corpus alongside Gutenberg, so
-        it reproduces that corpus's spacing exactly (`speak'st .` keeps the space
-        before the period). That is what keeps BLEU comparable with every score
-        recorded before this change - verify it with a round-trip before
-        trusting any number.
+        Trained on the parallel corpus too, so it reproduces that corpus's
+        spacing exactly - which is what keeps BLEU comparable.
         """
         kept = []
         for i in ids:
@@ -136,15 +104,3 @@ class SPMTokenizer:
             total += len(ids)
             unknown += sum(i == UNK_IDX for i in ids)
         return unknown / total if total else 0.0
-
-    def fertility(self, corpus) -> float:
-        """Subword pieces per whitespace word - how much the text got split."""
-        pieces = words = 0
-        for line in corpus:
-            pieces += len(self.encode(line))
-            words += len(line.split())
-        return pieces / words if words else 0.0
-
-    def round_trip_failures(self, corpus) -> list:
-        """Lines that do not decode back to themselves. Should be ~empty."""
-        return [line for line in corpus if self.decode(self.encode(line)) != line]

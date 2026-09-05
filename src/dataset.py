@@ -1,21 +1,10 @@
 """
-Shakespeare -> modern English data pipeline.
+Shakespeare -> modern parallel corpus.
 
-Corpus: harsh19/Shakespearizing-Modern-English, sentences from SparkNotes'
-No Fear Shakespeare aligned line by line with the originals.
+    .original  Shakespeare -> source        .modern  the rewrite -> target
 
-    .original  Shakespeare   -> source
-    .modern    the rewrite   -> target
-
-The split is by play (15 train, Twelfth Night valid, Romeo and Juliet test),
-so the test set is an unseen work. Do not reshuffle it into a random split -
-lines from the same play would leak across sides and inflate the score.
-
-Batches match the toy-task convention from toy_data.py:
-
-    src      tokens + EOS
-    tgt_in   SOS + tokens
-    tgt_out  tokens + EOS
+Split is by play (15 train, Twelfth Night valid, Romeo and Juliet test). Do not
+reshuffle - lines from one play would leak across sides.
 """
 
 import random
@@ -91,11 +80,9 @@ def collate_fn(batch, pad_idx: int = PAD_IDX):
 
 class LengthBucketSampler(Sampler):
     """
-    Groups sentences of similar length into the same batch.
+    Groups sentences of similar length into a batch.
 
-    Without this, one 121-token sentence drags a batch of 9-token sentences up
-    to width 121 and the model spends most of its compute on padding. Batch
-    order is still shuffled, so the model does not see length in a fixed order.
+    Cuts padding from 75% to 9% over an epoch. Batch order stays shuffled.
     """
 
     def __init__(self, dataset, batch_size: int, pool_factor: int = 50, shuffle: bool = True):
@@ -133,7 +120,3 @@ def make_dataloader(dataset, batch_size: int = 64, shuffle: bool = True, bucket:
             collate_fn=collate_fn,
         )
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
-
-
-def to_device(batch, device):
-    return tuple(t.to(device) for t in batch)

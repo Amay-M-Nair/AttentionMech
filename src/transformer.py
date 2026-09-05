@@ -1,16 +1,10 @@
 """
 The full encoder-decoder transformer.
 
-    source tokens                       target tokens (shifted right)
-         |                                       |
-    embed x sqrt(d_model)               embed x sqrt(d_model)
-    + positional encoding               + positional encoding
-         |                                       |
-    N x EncoderLayer                    N x DecoderLayer  <-- reads encoder
-         |                                       |             output here
-      LayerNorm  ----- memory ----->          LayerNorm
-                                                 |
-                                            Linear -> vocab logits
+    embed x sqrt(d_model) + positional -> N encoder layers -> memory
+                                       -> N decoder layers -> Linear -> logits
+
+Source embedding, target embedding and output projection are one tied matrix.
 """
 
 import math
@@ -97,12 +91,7 @@ class Decoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    """
-    Encoder-decoder transformer with a single shared vocabulary.
-
-    Source embedding, target embedding and output projection are all the same
-    matrix.
-    """
+    """Encoder-decoder transformer with one shared, tied vocabulary."""
 
     def __init__(self, config: TransformerConfig):
         super().__init__()
@@ -148,8 +137,7 @@ class Transformer(nn.Module):
 
     def encode(self, src, src_mask=None):
         """
-        Run the encoder alone - generation encodes once, then decodes
-        repeatedly.
+        Run the encoder alone - generation encodes once, decodes repeatedly.
         """
         if src_mask is None:
             src_mask = make_pad_mask(src, self.pad_idx)

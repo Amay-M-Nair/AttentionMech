@@ -1,9 +1,4 @@
-"""
-Encoder and decoder blocks.
-
-Pre-norm throughout: x = x + sublayer(norm(x)), rather than the paper's
-post-norm.
-"""
+"""Encoder and decoder blocks. Pre-norm: x = x + sublayer(norm(x))."""
 
 import torch.nn as nn
 
@@ -58,7 +53,7 @@ class EncoderLayer(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    """Causal self-attention, cross-attention, then feed-forward. Three sublayers."""
+    """Causal self-attention, cross-attention, feed-forward."""
 
     def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
@@ -88,8 +83,7 @@ class DecoderLayer(nn.Module):
         self_out, self_attn_weights = self.self_attn(normed, normed, normed, tgt_mask)
         x = x + self.dropout(self_out)
 
-        # queries from the decoder, keys/values from the encoder.
-        # masked with src_mask: source padding is what must be hidden here
+        # queries from the decoder, keys/values from the encoder
         normed = self.norm2(x)
         cross_out, cross_attn_weights = self.cross_attn(normed, memory, memory, src_mask)
         x = x + self.dropout(cross_out)
