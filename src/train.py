@@ -18,8 +18,11 @@ import torch
 import torch.nn as nn
 
 from .config import TransformerConfig
-from .evaluate import bleu
 from .inference import translate_corpus
+
+# `bleu` is imported inside fit() rather than here: it pulls in sacrebleu, and
+# pretraining never scores BLEU. A module-level import would make the whole
+# pretraining path depend on an evaluation library it does not use.
 
 
 def make_criterion(pad_idx: int, label_smoothing: float = 0.1):
@@ -227,6 +230,8 @@ def fit(
 
         train_loss, train_acc = running_loss / seen, running_acc / seen
         valid_loss, valid_acc = evaluate_loss(model, valid_loader, criterion, device)
+
+        from .evaluate import bleu
 
         hypotheses = translate_corpus(model, valid_source, vocab, device)
         score = bleu(hypotheses, valid_target)
