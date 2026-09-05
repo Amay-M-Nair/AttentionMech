@@ -6,16 +6,24 @@ own predictions, so every position trains in parallel. The (tgt_in, tgt_out)
 offset is built into the batch, so nothing is sliced here.
 """
 
+from dataclasses import asdict
+from pathlib import Path
+
 import torch
 import torch.nn as nn
+
+from .config import TransformerConfig
+from .evaluate import bleu
+from .inference import translate_corpus
 
 
 def make_criterion(pad_idx: int, label_smoothing: float = 0.1):
     """
     Padding is excluded from the loss entirely.
 
-    Label smoothing spreads a little probability mass off the correct token,
-    which stops the model driving logits to extremes and generalising worse.
+    The model emits logits and CrossEntropyLoss log-softmaxes internally. Label
+    smoothing spreads a little probability mass off the correct token, which
+    stops the model driving logits to extremes and generalising worse.
     """
     return nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=label_smoothing)
 
@@ -127,3 +135,132 @@ def overfit_batch(model, batch, steps: int = 300, lr: float = 1e-3,
         log_every=log_every,
         verbose=verbose,
     )
+
+
+# ---------------------------------------------------------------------------
+# Training on a real corpus: epochs, validation, checkpointing, early stopping
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate_loss(model, loader, criterion, device):
+    """Average loss and token accuracy over a loader, weighted by real tokens."""
+    model.eval()
+    total_loss = total_correct = total_tokens = 0
+
+    for src, tgt_in, tgt_out in loader:
+        src, tgt_in, tgt_out = src.to(device), tgt_in.to(device), tgt_out.to(device)
+        logits = model(src, tgt_in)
+
+        mask = tgt_out != criterion.ignore_index
+        n = mask.sum().item()
+
+        loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+        total_loss += loss.item() * n
+        total_correct += (((logits.argmax(-1) == tgt_out) & mask).sum().item())
+        total_tokens += n
+
+    return total_loss / total_tokens, total_correct / total_tokens
+
+
+def save_checkpoint(path, model, config, epoch, score):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"model": model.state_dict(), "config": asdict(config),
+         "epoch": epoch, "score": score},
+        path,
+    )
+
+
+def load_checkpoint(path, model=None, device=None):
+    """Returns (model, checkpoint). Builds the model from the saved config if needed."""
+    checkpoint = torch.load(path, map_location=device or "cpu", weights_only=False)
+    if model is None:
+        from .transformer import build_model
+        model = build_model(TransformerConfig(**checkpoint["config"]))
+    model.load_state_dict(checkpoint["model"])
+    if device is not None:
+        model = model.to(device)
+    return model, checkpoint
+
+
+def fit(
+    model,
+    config,
+    train_loader,
+    valid_loader,
+    valid_source,
+    valid_target,
+    vocab,
+    device,
+    epochs: int = 30,
+    lr: float = 1e-3,
+    warmup: int = 400,
+    label_smoothing: float = 0.1,
+    clip: float = 1.0,
+    patience: int = 5,
+    checkpoint_path: str = "checkpoints/best.pt",
+    baseline: float = None,
+):
+    """
+    Train for up to `epochs`, keeping the checkpoint with the best validation
+    BLEU.
+
+    Selection is on BLEU, not validation loss. The two diverge - loss keeps
+    improving on token-level confidence after BLEU has peaked - and BLEU is
+    what the task is actually judged on.
+
+    Args:
+        valid_source/valid_target: raw strings, for scoring real translations
+        baseline: copy-baseline BLEU, printed alongside so the score is never
+                  read in isolation
+    """
+    criterion = make_criterion(model.pad_idx, label_smoothing)
+    optimizer = make_optimizer(model, lr)
+    scheduler = make_scheduler(optimizer, warmup)
+
+    history = {"epoch": [], "train_loss": [], "valid_loss": [],
+               "train_acc": [], "valid_acc": [], "bleu": []}
+    best_bleu, best_epoch, stale = -1.0, 0, 0
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running_loss = running_acc = seen = 0
+
+        for batch in train_loader:
+            batch = tuple(t.to(device) for t in batch)
+            loss, acc = train_step(model, batch, criterion, optimizer, scheduler, clip)
+            running_loss += loss
+            running_acc += acc
+            seen += 1
+
+        train_loss, train_acc = running_loss / seen, running_acc / seen
+        valid_loss, valid_acc = evaluate_loss(model, valid_loader, criterion, device)
+
+        hypotheses = translate_corpus(model, valid_source, vocab, device)
+        score = bleu(hypotheses, valid_target)
+
+        history["epoch"].append(epoch)
+        history["train_loss"].append(train_loss)
+        history["valid_loss"].append(valid_loss)
+        history["train_acc"].append(train_acc)
+        history["valid_acc"].append(valid_acc)
+        history["bleu"].append(score)
+
+        marker = ""
+        if score > best_bleu:
+            best_bleu, best_epoch, stale = score, epoch, 0
+            save_checkpoint(checkpoint_path, model, config, epoch, score)
+            marker = "  <- best"
+        else:
+            stale += 1
+
+        note = "" if baseline is None else f" (baseline {baseline:.2f})"
+        print(f"epoch {epoch:>3}  train {train_loss:.3f}/{train_acc:5.1%}  "
+              f"valid {valid_loss:.3f}/{valid_acc:5.1%}  BLEU {score:6.2f}{note}{marker}")
+
+        if stale >= patience:
+            print(f"\nno improvement for {patience} epochs - stopping")
+            break
+
+    print(f"\nbest BLEU {best_bleu:.2f} at epoch {best_epoch}  ->  {checkpoint_path}")
+    return history
