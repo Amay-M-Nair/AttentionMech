@@ -2,7 +2,8 @@
 
 **Result: the model lost to doing nothing.** This is the measurement that justifies pretraining.
 
-Notebook: [`03_train_shakespeare.ipynb`](../notebooks/03_train_shakespeare.ipynb)
+The notebook that produced this was removed once these findings were written down.
+It is in git history at `916b080` as `notebooks/03_train_shakespeare.ipynb`.
 
 ---
 
