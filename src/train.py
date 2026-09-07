@@ -198,6 +198,9 @@ def fit(
     patience: int = 5,
     checkpoint_path: str = "checkpoints/best.pt",
     baseline: float = None,
+    eval_beam: int = 1,
+    eval_alpha: float = 1.0,
+    eval_batch: int = 32,
 ):
     """
     Train up to `epochs`, keeping the best-validation-BLEU checkpoint.
@@ -208,6 +211,15 @@ def fit(
     Args:
         valid_source/valid_target: raw strings, for scoring translations
         baseline: copy-baseline BLEU, printed alongside
+        eval_beam: beam size for validation. 1 = greedy, which is fast but can
+            score ~1.7 BLEU below beam on a model prone to repetition - and then
+            selects checkpoints on a metric you do not report. Costs roughly
+            beam_size x the validation time.
+        eval_alpha: length penalty, tuned on validation
+        eval_batch: sentences per decode batch. Beam search holds
+            eval_batch x eval_beam sequences at once, so the default is
+            deliberately smaller than translate_corpus's own default of 128 -
+            128 x 4 will OOM a 4 GB card.
     """
     criterion = make_criterion(model.pad_idx, label_smoothing)
     optimizer = make_optimizer(model, lr)
@@ -233,7 +245,9 @@ def fit(
 
         from .evaluate import bleu
 
-        hypotheses = translate_corpus(model, valid_source, vocab, device)
+        hypotheses = translate_corpus(model, valid_source, vocab, device,
+                                      batch_size=eval_batch,
+                                      beam_size=eval_beam, length_penalty=eval_alpha)
         score = bleu(hypotheses, valid_target)
 
         history["epoch"].append(epoch)
@@ -251,9 +265,11 @@ def fit(
         else:
             stale += 1
 
+        decode = "greedy" if eval_beam <= 1 else f"beam{eval_beam}"
         note = "" if baseline is None else f" (baseline {baseline:.2f})"
         print(f"epoch {epoch:>3}  train {train_loss:.3f}/{train_acc:5.1%}  "
-              f"valid {valid_loss:.3f}/{valid_acc:5.1%}  BLEU {score:6.2f}{note}{marker}")
+              f"valid {valid_loss:.3f}/{valid_acc:5.1%}  "
+              f"BLEU[{decode}] {score:6.2f}{note}{marker}")
 
         if stale >= patience:
             print(f"\nno improvement for {patience} epochs - stopping")
