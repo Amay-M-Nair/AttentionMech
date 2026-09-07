@@ -12,39 +12,31 @@ import sentencepiece as spm
 
 from .config import EOS_IDX, PAD_IDX, SOS_IDX, UNK_IDX
 
-# Direction tokens, for the bidirectional and multilingual work later.
-TO_MODERN = "<2modern>"
-TO_SHAKESPEARE = "<2shakespeare>"
-DIRECTION_TOKENS = (TO_MODERN, TO_SHAKESPEARE)
-
-NUM_SENTINELS = 100
-
-
-def sentinel(i: int) -> str:
-    """Name of the i-th span-corruption sentinel."""
-    return f"<extra_id_{i}>"
-
-
-SENTINELS = tuple(sentinel(i) for i in range(NUM_SENTINELS))
-
-
 class SPMTokenizer:
-    """Subword tokenizer with the same surface as `Vocab`."""
+    """Subword tokenizer. Only the four specials in config.py are reserved."""
 
     def __init__(self, model_path):
         self.sp = spm.SentencePieceProcessor(model_file=str(model_path))
         self.model_path = str(model_path)
-        self.sentinel_ids = [self.sp.piece_to_id(s) for s in SENTINELS]
 
     @classmethod
-    def train(cls, input_files, model_prefix, vocab_size: int = 32000,
-              model_type: str = "unigram", character_coverage: float = 0.9999,
+    def train(cls, input_files, model_prefix, vocab_size: int = 8000,
+              model_type: str = "unigram", character_coverage: float = 1.0,
               input_sentence_size: int = 5_000_000):
         """
         Train on one or more plain-text files, one sentence per line.
 
+        Pass BOTH languages to get a joint vocabulary - a shared vocabulary is
+        what lets the tied embedding serve encoder and decoder alike, and Latin
+        and English share an alphabet and a great deal of word stock.
+
         Special ids are pinned to config.py - SentencePiece disables pad by
         default, which would shift every other id.
+
+        byte_fallback spends 256 slots so that ANY character can be encoded, as
+        raw bytes when nothing better exists. Without it, a character absent
+        from the training text becomes <unk> and the text cannot round-trip -
+        and the tokenizer must be trained on train only, so that case is real.
         """
         prefix = Path(model_prefix)
         prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -58,13 +50,13 @@ class SPMTokenizer:
             vocab_size=vocab_size,
             model_type=model_type,
             character_coverage=character_coverage,
+            byte_fallback=True,
             input_sentence_size=input_sentence_size,
             shuffle_input_sentence=True,
             pad_id=PAD_IDX,
             bos_id=SOS_IDX,
             eos_id=EOS_IDX,
             unk_id=UNK_IDX,
-            user_defined_symbols=list(DIRECTION_TOKENS) + list(SENTINELS),
         )
         return cls(prefix.with_suffix(".model"))
 
