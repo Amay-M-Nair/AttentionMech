@@ -1,8 +1,9 @@
 """
 BLEU, always reported against the copy baseline.
 
-tokenize="none" everywhere: the corpus is already tokenised, and the setting
-must match across the baseline, validation and the final test number.
+Standard sacreBLEU tokenisation - the corpus is natural text, so scores are
+comparable with published work. What matters is that the same setting is used
+for the baseline, for validation, and for the final test number.
 """
 
 import sacrebleu
@@ -10,7 +11,7 @@ import sacrebleu
 
 def bleu(hypotheses, references) -> float:
     """
-    Corpus BLEU over already-tokenised text.
+    Corpus BLEU.
 
     Args:
         hypotheses: list of predicted strings
@@ -18,11 +19,7 @@ def bleu(hypotheses, references) -> float:
     """
     if len(hypotheses) != len(references):
         raise ValueError(f"{len(hypotheses)} hypotheses vs {len(references)} references")
-    # force=True silences sacreBLEU's "you forgot to detokenize" warning - here
-    # the text is tokenised deliberately, which is exactly what it complains about.
-    return sacrebleu.corpus_bleu(
-        hypotheses, [references], tokenize="none", force=True
-    ).score
+    return sacrebleu.corpus_bleu(hypotheses, [references]).score
 
 
 def copy_baseline(source, target) -> float:

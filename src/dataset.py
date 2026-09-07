@@ -1,10 +1,9 @@
 """
-Shakespeare -> modern parallel corpus.
+Latin -> English parallel corpus.
 
-    .original  Shakespeare -> source        .modern  the rewrite -> target
+    .la  Latin -> source        .en  English -> target
 
-Split is by play (15 train, Twelfth Night valid, Romeo and Juliet test). Do not
-reshuffle - lines from one play would leak across sides.
+Splits come from the dataset and are not reshuffled. Built by latin_data.py.
 """
 
 import random
@@ -21,7 +20,7 @@ SPLITS = ("train", "valid", "test")
 def load_split(data_dir, split: str):
     """
     Returns:
-        (source_lines, target_lines) - Shakespeare, modern
+        (source_lines, target_lines) - Latin, English
     """
     if split not in SPLITS:
         raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
@@ -29,11 +28,11 @@ def load_split(data_dir, split: str):
     data_dir = Path(data_dir)
 
     def read(side):
-        path = data_dir / f"{split}.{side}.nltktok"
+        path = data_dir / f"{split}.{side}"
         with open(path, encoding="utf-8") as f:
             return [line.rstrip("\n") for line in f]
 
-    source, target = read("original"), read("modern")
+    source, target = read("la"), read("en")
     if len(source) != len(target):
         raise ValueError(f"{split} is misaligned: {len(source)} vs {len(target)} lines")
     return source, target
