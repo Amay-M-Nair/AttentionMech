@@ -102,9 +102,17 @@ def exact_match(pred, gold, eos_idx: int = EOS_IDX, pad_idx: int = PAD_IDX) -> f
 @torch.no_grad()
 def translate_corpus(model, lines, vocab, device=None, batch_size: int = 128,
                      max_len: int = None, beam_size: int = 1,
-                     length_penalty: float = 0.6) -> list:
+                     length_penalty: float = 0.6, src_max_len: int = None) -> list:
     """
     Translate many sentences at once, sorted by length to limit padding.
+
+    Args:
+        src_max_len: truncate encoded source. Match the max_len the model was
+            TRAINED with - TranslationDataset truncates, so without this the
+            model is asked at inference to read sequences longer than anything
+            it saw, and beam search holds batch_size x beam_size of them.
+        max_len: generation cap. Defaults to source length plus headroom, which
+            on a long source means hundreds of decode steps per batch.
 
     Returns translations aligned with `lines`.
     """
@@ -113,6 +121,8 @@ def translate_corpus(model, lines, vocab, device=None, batch_size: int = 128,
         device = next(model.parameters()).device
 
     encoded = [vocab.encode(line) for line in lines]
+    if src_max_len is not None:
+        encoded = [ids[:src_max_len] for ids in encoded]
     order = sorted(range(len(encoded)), key=lambda i: len(encoded[i]))
 
     results = [None] * len(encoded)

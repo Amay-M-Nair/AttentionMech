@@ -200,7 +200,9 @@ def fit(
     baseline: float = None,
     eval_beam: int = 1,
     eval_alpha: float = 1.0,
-    eval_batch: int = 32,
+    eval_batch: int = 16,
+    eval_max_len: int = None,
+    eval_src_max_len: int = None,
 ):
     """
     Train up to `epochs`, keeping the best-validation-BLEU checkpoint.
@@ -218,8 +220,13 @@ def fit(
         eval_alpha: length penalty, tuned on validation
         eval_batch: sentences per decode batch. Beam search holds
             eval_batch x eval_beam sequences at once, so the default is
-            deliberately smaller than translate_corpus's own default of 128 -
-            128 x 4 will OOM a 4 GB card.
+            deliberately small - translate_corpus's own default of 128 with
+            beam 4 will OOM a 4 GB card.
+        eval_src_max_len: truncate validation sources to the max_len the model
+            was trained on. Without it, decoding sees sequences far longer than
+            anything in training and memory scales with their length.
+        eval_max_len: generation cap. Defaults to source length plus headroom,
+            which on a long source is hundreds of decode steps.
     """
     criterion = make_criterion(model.pad_idx, label_smoothing)
     optimizer = make_optimizer(model, lr)
@@ -247,7 +254,9 @@ def fit(
 
         hypotheses = translate_corpus(model, valid_source, vocab, device,
                                       batch_size=eval_batch,
-                                      beam_size=eval_beam, length_penalty=eval_alpha)
+                                      beam_size=eval_beam, length_penalty=eval_alpha,
+                                      max_len=eval_max_len,
+                                      src_max_len=eval_src_max_len)
         score = bleu(hypotheses, valid_target)
 
         history["epoch"].append(epoch)
