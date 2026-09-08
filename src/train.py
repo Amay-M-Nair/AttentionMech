@@ -203,6 +203,7 @@ def fit(
     eval_batch: int = 16,
     eval_max_len: int = None,
     eval_src_max_len: int = None,
+    log_every: int = 200,
 ):
     """
     Train up to `epochs`, keeping the best-validation-BLEU checkpoint.
@@ -227,6 +228,10 @@ def fit(
             anything in training and memory scales with their length.
         eval_max_len: generation cap. Defaults to source length plus headroom,
             which on a long source is hundreds of decode steps.
+        log_every: print running loss every N training steps. An epoch here is
+            ~3,000 steps and the epoch line only prints after validation, so
+            without this a working run and a hung one look identical for
+            minutes. 0 disables it.
     """
     criterion = make_criterion(model.pad_idx, label_smoothing)
     optimizer = make_optimizer(model, lr)
@@ -240,12 +245,18 @@ def fit(
         model.train()
         running_loss = running_acc = seen = 0
 
-        for batch in train_loader:
+        steps = len(train_loader)
+        for step, batch in enumerate(train_loader, 1):
             batch = tuple(t.to(device) for t in batch)
             loss, acc = train_step(model, batch, criterion, optimizer, scheduler, clip)
             running_loss += loss
             running_acc += acc
             seen += 1
+
+            if log_every and step % log_every == 0:
+                print(f"  epoch {epoch:>3}  step {step:>5}/{steps}  "
+                      f"loss {running_loss / seen:.3f}  acc {running_acc / seen:5.1%}",
+                      flush=True)
 
         train_loss, train_acc = running_loss / seen, running_acc / seen
         valid_loss, valid_acc = evaluate_loss(model, valid_loader, criterion, device)
@@ -278,7 +289,7 @@ def fit(
         note = "" if baseline is None else f" (baseline {baseline:.2f})"
         print(f"epoch {epoch:>3}  train {train_loss:.3f}/{train_acc:5.1%}  "
               f"valid {valid_loss:.3f}/{valid_acc:5.1%}  "
-              f"BLEU[{decode}] {score:6.2f}{note}{marker}")
+              f"BLEU[{decode}] {score:6.2f}{note}{marker}", flush=True)
 
         if stale >= patience:
             print(f"\nno improvement for {patience} epochs - stopping")
