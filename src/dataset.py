@@ -42,21 +42,23 @@ class TranslationDataset(Dataset):
     """Encoded sentence pairs. Long sentences are truncated, not dropped."""
 
     def __init__(self, source_lines, target_lines, vocab, max_len: int = 100):
-        self.vocab = vocab
         self.max_len = max_len
-        self.pairs = list(zip(source_lines, target_lines))
 
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, index):
-        source, target = self.pairs[index]
-
+        # Encoded once, here. The previous version tokenised inside __getitem__,
+        # so every epoch re-ran SentencePiece over the whole corpus - 188k
+        # encodes per epoch at 94k pairs, on the main process, in series with
+        # the GPU.
+        #
         # Truncate before adding EOS/SOS, so every sequence still terminates
         # properly - a cut-off sentence with no EOS teaches the model not to stop.
-        src_ids = self.vocab.encode(source)[: self.max_len]
-        tgt_ids = self.vocab.encode(target)[: self.max_len]
+        self.source = [vocab.encode(line)[: max_len] for line in source_lines]
+        self.target = [vocab.encode(line)[: max_len] for line in target_lines]
 
+    def __len__(self):
+        return len(self.source)
+
+    def __getitem__(self, index):
+        src_ids, tgt_ids = self.source[index], self.target[index]
         return (
             torch.tensor(src_ids + [EOS_IDX]),
             torch.tensor([SOS_IDX] + tgt_ids),
@@ -82,6 +84,9 @@ class LengthBucketSampler(Sampler):
     Groups sentences of similar length into a batch.
 
     Cuts padding from 75% to 9% over an epoch. Batch order stays shuffled.
+
+    Bucketing is on encoded length, not word count: token length is what gets
+    padded, and Latin's fertility of 1.84 means the two are not proportional.
     """
 
     def __init__(self, dataset, batch_size: int, pool_factor: int = 50, shuffle: bool = True):
@@ -89,7 +94,7 @@ class LengthBucketSampler(Sampler):
         self.batch_size = batch_size
         self.pool_size = batch_size * pool_factor
         self.shuffle = shuffle
-        self.lengths = [len(s.split()) for s, _ in dataset.pairs]
+        self.lengths = [len(ids) for ids in dataset.source]
 
     def __iter__(self):
         indices = list(range(len(self.dataset)))

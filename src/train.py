@@ -140,24 +140,32 @@ def overfit_batch(model, batch, steps: int = 300, lr: float = 1e-3,
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_loss(model, loader, criterion, device):
+def evaluate_loss(model, loader, criterion, device, amp: bool = False):
     """Average loss and token accuracy over a loader, weighted by real tokens."""
     model.eval()
-    total_loss = total_correct = total_tokens = 0
+    total_loss = torch.zeros((), device=device)
+    total_correct = torch.zeros((), device=device)
+    total_tokens = torch.zeros((), device=device)
 
+    use_amp = amp and torch.device(device).type == "cuda"
     for src, tgt_in, tgt_out in loader:
-        src, tgt_in, tgt_out = src.to(device), tgt_in.to(device), tgt_out.to(device)
-        logits = model(src, tgt_in)
+        src, tgt_in, tgt_out = (t.to(device, non_blocking=True)
+                                for t in (src, tgt_in, tgt_out))
+
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = model(src, tgt_in)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
 
         mask = tgt_out != criterion.ignore_index
-        n = mask.sum().item()
+        n = mask.sum()
 
-        loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
-        total_loss += loss.item() * n
-        total_correct += (((logits.argmax(-1) == tgt_out) & mask).sum().item())
+        # Accumulated on the GPU. Calling .item() per batch would synchronise
+        # every iteration and stall the pipeline for no reason.
+        total_loss += loss.detach().float() * n
+        total_correct += ((logits.argmax(-1) == tgt_out) & mask).sum()
         total_tokens += n
 
-    return total_loss / total_tokens, total_correct / total_tokens
+    return (total_loss / total_tokens).item(), (total_correct / total_tokens).item()
 
 
 def save_checkpoint(path, model, config, epoch, score):
@@ -203,6 +211,8 @@ def fit(
     eval_batch: int = 16,
     eval_max_len: int = None,
     eval_src_max_len: int = None,
+    eval_limit: int = None,
+    amp: bool = True,
     log_every: int = 200,
 ):
     """
@@ -228,6 +238,14 @@ def fit(
             anything in training and memory scales with their length.
         eval_max_len: generation cap. Defaults to source length plus headroom,
             which on a long source is hundreds of decode steps.
+        eval_limit: score BLEU on the first N validation sentences instead of
+            all of them. Beam decoding has no KV cache, so it costs more per
+            epoch than the training pass; 1000 of 3003 keeps selection stable
+            at a third of the price. Selection only - the reported number comes
+            from scoring test once, at the end.
+        amp: mixed precision for training and for validation decoding. ~2x on a
+            T4. Decoding is then not bit-identical to fp32; that is fine for
+            picking a checkpoint, less so for a number you publish.
         log_every: print running loss every N training steps. An epoch here is
             ~3,000 steps and the epoch line only prints after validation, so
             without this a working run and a hung one look identical for
@@ -236,6 +254,10 @@ def fit(
     criterion = make_criterion(model.pad_idx, label_smoothing)
     optimizer = make_optimizer(model, lr)
     scheduler = make_scheduler(optimizer, warmup)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp and torch.device(device).type == "cuda")
+
+    eval_source = valid_source if eval_limit is None else valid_source[:eval_limit]
+    eval_target = valid_target if eval_limit is None else valid_target[:eval_limit]
 
     history = {"epoch": [], "train_loss": [], "valid_loss": [],
                "train_acc": [], "valid_acc": [], "bleu": []}
@@ -243,32 +265,52 @@ def fit(
 
     for epoch in range(1, epochs + 1):
         model.train()
-        running_loss = running_acc = seen = 0
+        # Accumulated as GPU tensors: .item() forces a synchronisation, and two
+        # per step over 2,941 steps is 5,882 stalls per epoch.
+        running_loss = torch.zeros((), device=device)
+        running_acc = torch.zeros((), device=device)
+        seen = 0
 
         steps = len(train_loader)
         for step, batch in enumerate(train_loader, 1):
-            batch = tuple(t.to(device) for t in batch)
-            loss, acc = train_step(model, batch, criterion, optimizer, scheduler, clip)
-            running_loss += loss
-            running_acc += acc
+            src, tgt_in, tgt_out = (t.to(device, non_blocking=True) for t in batch)
+
+            with torch.amp.autocast("cuda", enabled=scaler.is_enabled()):
+                logits = model(src, tgt_in)
+                loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            # unscale before clipping, or the threshold applies to scaled gradients
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+            with torch.no_grad():
+                mask = tgt_out != criterion.ignore_index
+                running_acc += ((logits.argmax(-1) == tgt_out) & mask).sum() / mask.sum()
+            running_loss += loss.detach().float()
             seen += 1
 
             if log_every and step % log_every == 0:
                 print(f"  epoch {epoch:>3}  step {step:>5}/{steps}  "
-                      f"loss {running_loss / seen:.3f}  acc {running_acc / seen:5.1%}",
-                      flush=True)
+                      f"loss {running_loss.item() / seen:.3f}  "
+                      f"acc {running_acc.item() / seen:5.1%}", flush=True)
 
-        train_loss, train_acc = running_loss / seen, running_acc / seen
-        valid_loss, valid_acc = evaluate_loss(model, valid_loader, criterion, device)
+        train_loss = running_loss.item() / seen
+        train_acc = running_acc.item() / seen
+        valid_loss, valid_acc = evaluate_loss(model, valid_loader, criterion, device, amp=amp)
 
         from .evaluate import bleu
 
-        hypotheses = translate_corpus(model, valid_source, vocab, device,
+        hypotheses = translate_corpus(model, eval_source, vocab, device,
                                       batch_size=eval_batch,
                                       beam_size=eval_beam, length_penalty=eval_alpha,
                                       max_len=eval_max_len,
-                                      src_max_len=eval_src_max_len)
-        score = bleu(hypotheses, valid_target)
+                                      src_max_len=eval_src_max_len, amp=amp)
+        score = bleu(hypotheses, eval_target)
 
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
@@ -286,6 +328,8 @@ def fit(
             stale += 1
 
         decode = "greedy" if eval_beam <= 1 else f"beam{eval_beam}"
+        if eval_limit is not None:
+            decode += f"/{len(eval_source)}"
         note = "" if baseline is None else f" (baseline {baseline:.2f})"
         print(f"epoch {epoch:>3}  train {train_loss:.3f}/{train_acc:5.1%}  "
               f"valid {valid_loss:.3f}/{valid_acc:5.1%}  "
@@ -397,7 +441,7 @@ def pretrain(
     criterion = make_criterion(model.pad_idx, label_smoothing)
     optimizer = make_optimizer(model, lr)
     scheduler = make_scheduler(optimizer, warmup)
-    scaler = torch.amp.GradScaler("cuda", enabled=amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=amp and torch.device(device).type == "cuda")
 
     start_step = 0
     if resume and Path(checkpoint_path).exists():

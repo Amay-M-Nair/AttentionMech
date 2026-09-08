@@ -12,9 +12,15 @@ from .masking import make_pad_mask
 
 
 def step_logprobs(model, tokens, memory, src_mask):
-    """Log-probabilities for the next token. Shared by greedy and beam."""
+    """
+    Log-probabilities for the next token. Shared by greedy and beam.
+
+    .float() before the softmax: under autocast the generator returns fp16, and
+    beam search sums these over every step - accumulating in half precision
+    would let rounding decide between beams.
+    """
     output, _, _ = model.decode(tokens, memory, src_mask=src_mask)
-    return F.log_softmax(model.generator(output[:, -1]), dim=-1)
+    return F.log_softmax(model.generator(output[:, -1]).float(), dim=-1)
 
 
 @torch.no_grad()
@@ -102,7 +108,8 @@ def exact_match(pred, gold, eos_idx: int = EOS_IDX, pad_idx: int = PAD_IDX) -> f
 @torch.no_grad()
 def translate_corpus(model, lines, vocab, device=None, batch_size: int = 128,
                      max_len: int = None, beam_size: int = 1,
-                     length_penalty: float = 0.6, src_max_len: int = None) -> list:
+                     length_penalty: float = 0.6, src_max_len: int = None,
+                     amp: bool = False) -> list:
     """
     Translate many sentences at once, sorted by length to limit padding.
 
@@ -113,6 +120,9 @@ def translate_corpus(model, lines, vocab, device=None, batch_size: int = 128,
             it saw, and beam search holds batch_size x beam_size of them.
         max_len: generation cap. Defaults to source length plus headroom, which
             on a long source means hundreds of decode steps per batch.
+        amp: run the forward passes in half precision. Roughly 2x on a T4, and
+            with the fp32 softmax above the effect on output is marginal - but
+            it is not bit-identical, so leave it off for a number you report.
 
     Returns translations aligned with `lines`.
     """
@@ -136,11 +146,12 @@ def translate_corpus(model, lines, vocab, device=None, batch_size: int = 128,
             src[j, : len(row)] = row
 
         cap = max_len if max_len is not None else width + 10
-        if beam_size > 1:
-            predictions = beam_search_decode(model, src.to(device), beam_size=beam_size,
-                                             max_len=cap, length_penalty=length_penalty)
-        else:
-            predictions = greedy_decode(model, src.to(device), max_len=cap)
+        with torch.amp.autocast("cuda", enabled=amp and torch.device(device).type == "cuda"):
+            if beam_size > 1:
+                predictions = beam_search_decode(model, src.to(device), beam_size=beam_size,
+                                                 max_len=cap, length_penalty=length_penalty)
+            else:
+                predictions = greedy_decode(model, src.to(device), max_len=cap)
 
         for j, i in enumerate(chunk):
             results[i] = vocab.decode(predictions[j])
