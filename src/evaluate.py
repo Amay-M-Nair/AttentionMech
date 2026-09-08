@@ -22,6 +22,19 @@ def bleu(hypotheses, references) -> float:
     return sacrebleu.corpus_bleu(hypotheses, [references]).score
 
 
+def chrf(hypotheses, references) -> float:
+    """
+    Character n-gram F-score.
+
+    Reported beside BLEU because it scores partial credit on word forms. Latin
+    is inflected and English is not, so a translation can be right about a word
+    and wrong about its ending; BLEU sees only a miss.
+    """
+    if len(hypotheses) != len(references):
+        raise ValueError(f"{len(hypotheses)} hypotheses vs {len(references)} references")
+    return sacrebleu.corpus_chrf(hypotheses, [references]).score
+
+
 def copy_baseline(source, target) -> float:
     """
     BLEU for echoing the input unchanged.
